@@ -11,8 +11,7 @@ import pytest
 @pytest.fixture
 def api(monkeypatch):
     service = ModuleType('backend.query')
-    service.query_observations = Mock(return_value={'type': 'FeatureCollection', 'features': [], 'reference_time': '2026-11-13T15:00:00.000000Z'})
-    service.query_clusters = Mock(return_value={'type': 'FeatureCollection', 'features': [], 'next_cursor': None})
+    service.query_cells = Mock(return_value={'type': 'FeatureCollection', 'features': [], 'next_cursor': None, 'satellites': []})
     errors = ModuleType('botocore.exceptions')
     errors.BotoCoreError = type('BotoCoreError', (Exception,), {})
     errors.ClientError = type('ClientError', (Exception,), {})
@@ -21,7 +20,7 @@ def api(monkeypatch):
     spec = importlib.util.spec_from_file_location('public_api_under_test', 'backend/handler.py')
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    return module, service.query_clusters, errors
+    return module, service.query_cells, errors
 
 
 def event(path='/api/clusters', method='GET', params=None):
@@ -31,12 +30,18 @@ def event(path='/api/clusters', method='GET', params=None):
 
 def test_function_url_success_and_pagination_forwarded(api):
     module, query, _ = api
-    result = module.handler(event(params={'day': '2026-11-13', 'window': '15:40', 'cursor': 'abc', 'limit': '10'}), None)
+    result = module.handler(event(params={'satellite': 'AQUA', 'cursor': 'abc', 'limit': '10'}), None)
     assert result['statusCode'] == 200
     assert json.loads(result['body'])['type'] == 'FeatureCollection'
-    query.assert_called_once_with(day='2026-11-13', window='15:40', satellite=None, cursor='abc', limit=10)
+    query.assert_called_once_with(satellite='AQUA', cursor='abc', limit=10)
     assert result['headers']['Cache-Control'] == 'no-store'
     assert not any(h.lower().startswith('access-control') for h in result['headers'])
+
+
+def test_aggregate_is_default(api):
+    module, query, _ = api
+    assert module.handler(event(), None)['statusCode'] == 200
+    query.assert_called_once_with(satellite=None, cursor=None, limit=500)
 
 
 @pytest.mark.parametrize('path', ['/', '/api/health'])
@@ -53,39 +58,30 @@ def test_methods_and_routes(api):
     query.assert_not_called()
 
 
-def test_validation_returns_400(api):
+@pytest.mark.parametrize('params', [
+    {'day': '2026-11-13'}, {'window': '15:40'}, {'view': 'recent'}, {'minutes': '60'},
+    {'as_of': '2026-11-13T15:00:00Z'}, {'satellite': 'AQUA', 'day': '2026-11-13'},
+    {'limit': 'bad'}, {'unknown': '1'},
+])
+def test_removed_time_filters_and_bad_params_return_400(api, params):
     module, query, _ = api
-    assert module.handler(event(params={'limit': 'bad'}), None)['statusCode'] == 400
+    assert module.handler(event(params=params), None)['statusCode'] == 400
     query.assert_not_called()
-    query.side_effect = ValueError('day inválido')
-    assert module.handler(event(params={'day': 'bad'}), None)['statusCode'] == 400
+
+
+def test_query_validation_returns_400(api):
+    module, query, _ = api
+    query.side_effect = ValueError('Cursor inválido')
+    assert module.handler(event(params={'cursor': 'bad'}), None)['statusCode'] == 400
 
 
 def test_errors_do_not_expose_internal_details(api):
     module, query, errors = api
     query.side_effect = errors.ClientError('secret configuration')
-    result = module.handler(event(params={'day': '2026-11-13'}), None)
+    result = module.handler(event(), None)
     assert result['statusCode'] == 503
     assert 'secret' not in result['body']
     query.side_effect = RuntimeError('internal path')
-    result = module.handler(event(params={'day': '2026-11-13'}), None)
+    result = module.handler(event(), None)
     assert result['statusCode'] == 500
     assert 'internal path' not in result['body']
-
-
-def test_recent_route_forwards_minutes_and_reference(api):
-    module, _, _ = api
-    service = sys.modules['backend.query'].query_observations
-    result = module.handler(event(params={'view': 'recent', 'minutes': '7', 'as_of': '2026-11-13T15:00:00Z'}), None)
-    assert result['statusCode'] == 200
-    service.assert_called_once_with(view='recent', minutes=7, satellite=None, cursor=None, limit=500, as_of='2026-11-13T15:00:00Z')
-
-
-def test_total_is_default_and_bad_minutes_fail(api):
-    module, _, _ = api
-    service = sys.modules['backend.query'].query_observations
-    assert module.handler(event(), None)['statusCode'] == 200
-    assert service.call_args.kwargs['view'] == 'all'
-    service.reset_mock()
-    assert module.handler(event(params={'view': 'recent', 'minutes': 'bad'}), None)['statusCode'] == 400
-    service.assert_not_called()

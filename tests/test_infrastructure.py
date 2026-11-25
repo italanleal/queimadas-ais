@@ -49,12 +49,13 @@ def test_public_function_url_and_read_only_backend():
     assert permission['InvokedViaFunctionUrl'] is True
 
 
-def test_observation_index_and_query_permission():
-    resources = yaml.load(Path('infra/template.yaml').read_text(), Loader=CloudFormationLoader)['Resources']
-    index = resources['DataTable']['Properties']['GlobalSecondaryIndexes'][0]
-    assert index['IndexName'] == 'ObservationsByTime'
-    assert index['KeySchema'] == [{'AttributeName': 'sk', 'KeyType': 'HASH'}, {'AttributeName': 'date', 'KeyType': 'RANGE'}]
-    assert index['Projection']['ProjectionType'] == 'ALL'
+def test_table_without_time_index_and_backend_scoped_to_table():
+    text = Path('infra/template.yaml').read_text()
+    resources = yaml.load(text, Loader=CloudFormationLoader)['Resources']
+    table = resources['DataTable']['Properties']
+    assert 'GlobalSecondaryIndexes' not in table
+    assert [a['AttributeName'] for a in table['AttributeDefinitions']] == ['pk', 'sk']
+    assert 'ObservationsByTime' not in text
     statement = resources['Backend']['Properties']['Policies'][-1]['Statement'][0]
     assert statement['Action'] == 'dynamodb:Query'
-    assert any('ObservationsByTime' in str(resource) for resource in statement['Resource'])
+    assert statement['Resource'] == {'GetAtt': 'DataTable.Arn'}

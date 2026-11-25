@@ -1,6 +1,6 @@
 # Observatório INPE · H3
 
-> **Visualização atual:** total acumulado por H3, com filtro opcional de últimos N minutos. Consulte [configuração do índice e atualização da Lambda](docs/VISUALIZACAO_TEMPO.md). As consultas por dia/dez minutos descritas abaixo permanecem como API de compatibilidade.
+> **Modelo atual:** o banco guarda apenas **hash H3 + contagem**, sem dimensão de tempo. O mapa mostra o total acumulado por célula, no agregado de todos os satélites ou de um satélite.
 
 Pipeline de focos de calor com produtor na sua máquina, dados brutos do INPE, consolidação cronológica, S3, SQS FIFO, Lambda consumidora, agregação H3, DynamoDB e mapa em D3.
 
@@ -36,27 +36,30 @@ A configuração desejada da atividade é concorrência reservada igual a 1, dec
 
 Para cada observação, a Lambda converte latitude/longitude para uma célula H3 na resolução configurada. Mensagens que falham voltam a ser tentadas; após cinco recebimentos sem sucesso, seguem para a DLQ para investigação e eventual reenvio. O consumidor usa `ReportBatchItemFailures` para sinalizar falhas ao SQS.
 
-### 5. Persistência: observações exatas e agregados
+### 5. Persistência: hash H3 + contagem
 
-O DynamoDB mantém dois tipos de item: a observação deduplicada com seu timestamp exato e o agregado por **intervalo de dez minutos UTC + satélite + hash H3 + resolução**. A inserção da observação e o incremento do contador são feitos na mesma transação. Se a observação já existe, o incremento não é repetido.
+O DynamoDB não guarda data, latitude nem longitude. Para cada observação, a Lambda grava em **uma única transação**:
 
-Essa separação permite manter os grupos solicitados na atividade e também oferecer filtros temporais mais precisos na visualização. Por exemplo, os últimos sete minutos não podem ser calculados corretamente apenas somando grupos inteiros de dez minutos.
+- um marcador de deduplicação `EVENT#<id>` (condição `attribute_not_exists(pk)`);
+- `ADD count 1` na célula do agregado de todos os satélites;
+- `ADD count 1` na célula do satélite da observação;
+- `ADD count 1` no total do satélite, usado como catálogo do filtro.
 
-### 6. Lambda pública de consulta e índice temporal
+Se o marcador já existe, a transação inteira é cancelada e nada é incrementado: reentregas do SQS não contam duas vezes.
 
-O índice `ObservationsByTime` organiza as observações existentes pela chave de resolução/agregação (`sk`) e pelo timestamp (`date`). A Lambda de consulta usa `Query` nesse índice para obter todo o histórico ou somente as observações dos últimos N minutos, sem executar `Scan`.
+### 6. Lambda pública de consulta
 
-A API agrupa cada página por hash H3 e satélite e devolve GeoJSON com contagens e cursor de paginação. Todas as páginas de uma rodada usam o mesmo instante de referência (`as_of`), para que o início do período não mude durante a leitura. Como é um índice secundário global, novas gravações podem levar algum tempo para aparecer nas consultas.
+A Lambda de consulta faz `Query` com leitura consistente em uma única partição: a do agregado ou a do satélite escolhido. Não há índice secundário nem `Scan`. A API devolve GeoJSON com `{h3, count, resolution}` por célula e `next_cursor` para paginação; a primeira página também traz a lista `satellites`. O cursor só é aceito na mesma partição em que foi emitido.
 
-A Function URL fornece o endpoint HTTPS público, sem API Gateway. A Lambda utiliza uma IAM role com permissão de consulta somente na tabela e no índice, além de logs. CORS autoriza as origens do frontend; ele não torna a API privada nem substitui autenticação.
+A Function URL fornece o endpoint HTTPS público, sem API Gateway. A Lambda utiliza uma IAM role com permissão `dynamodb:Query` somente na tabela, além de logs. CORS autoriza as origens do frontend; ele não torna a API privada nem substitui autenticação.
 
 ### 7. Website estático e mapa D3
 
-A hospedagem entrega os arquivos da pasta `frontend/` ao navegador. O JavaScript lê a URL pública em `config.js`, consulta a API e percorre todas as páginas. Depois soma os resultados pelo mesmo hash H3, inclusive entre horários e dias distintos, e desenha uma única célula para cada hash.
+A hospedagem entrega os arquivos da pasta `frontend/` ao navegador. O JavaScript lê a URL pública em `config.js`, consulta a API e percorre todas as páginas. Depois soma as contagens pelo mesmo hash H3 e desenha uma célula por hash.
 
-Por padrão, o mapa mostra **todo o histórico**. Ao ativar **Últimos N minutos**, considera somente observações cujo horário esteja dentro da janela móvel calculada pelo servidor. O filtro usa a data/hora da observação INPE, não o momento em que ela chegou ao SQS. Focos, células ocupadas e satélites são recalculados a partir do mesmo conjunto filtrado.
+Não há filtro de tempo: o mapa mostra **o total acumulado**. O único filtro é o de satélite: **Todos (agregado)** ou um satélite da lista devolvida pela API. Trocar a opção refaz a consulta com `?satellite=`.
 
-Uma nova consulta começa cinco segundos após terminar a anterior. Cada rodada substitui os dados exibidos, em vez de somar novamente a resposta anterior. Assim, novas observações aumentam os contadores e observações que saem da janela deixam de contar no modo recente. Em falhas de consulta, o mapa preserva o último resultado e sinaliza que ele pode estar desatualizado.
+Uma nova consulta começa cinco segundos após terminar a anterior. Cada rodada substitui os dados exibidos, em vez de somar novamente a resposta anterior. Em falhas de consulta, o mapa preserva o último resultado e sinaliza que ele pode estar desatualizado.
 
 ### Comandos relacionados ao fluxo
 
@@ -66,18 +69,17 @@ Uma nova consulta começa cinco segundos após terminar a anterior. Cada rodada 
 | `python -m producer.main --scrape --max-files 6` | Processa os seis arquivos mais recentes da listagem e envia o consolidado ao S3 |
 | `python -m producer.main --start` | Lê o snapshot preparado no S3 e envia observações ainda não enviadas ao SQS |
 | `python -m producer.main --scrape --start` | Executa preparação/upload e depois envio à fila |
-| `python -m producer.main --scrape --start --watch` | Repete preparação e envio a cada rodada de polling |
 
-Os arquivos e registros locais são cumulativos entre rodadas. `--max-files 6` limita a seleção de novos arquivos da listagem, mas não remove registros anteriores do consolidado. Para um teste local do zero, use `--reset --scrape --max-files 6`; o reset local não limpa o DynamoDB ou o S3.
+Os arquivos e registros locais são cumulativos entre rodadas. `--max-files 6` limita a seleção de novos arquivos da listagem, mas não remove registros anteriores do consolidado. Para um teste local do zero, use `--reset --scrape --max-files 6`; o reset local não limpa o DynamoDB ou o S3. Cada execução roda a rotina uma vez; para repetir, agende execuções externas (cron, Agendador de Tarefas).
 
 ## Aplicações isoladas
 
 | Diretório | Função | Execução |
 |---|---|---|
-| `producer/` | Download, consolidação, upload, streaming e envio | Sua máquina, rotina única ou contínua |
+| `producer/` | Download, consolidação, upload, streaming e envio | Sua máquina, uma execução por chamada |
 | `consumer/` | H3 e persistência idempotente | Lambda acionada pelo SQS |
-| `backend/` | Consulta temporal paginada e GeoJSON | Lambda com Function URL pública; servidor local opcional |
-| `frontend/` | Mapa Brasil, totais por H3, filtro temporal/satélite e zoom | Website estático, hospedagem independente |
+| `backend/` | Consulta paginada de células H3 e GeoJSON | Lambda com Function URL pública; servidor local opcional |
+| `frontend/` | Mapa Brasil, totais por H3, filtro de satélite e zoom | Website estático, hospedagem independente |
 | `common/` | Contrato e normalização das observações | Compartilhado no build |
 | `infra/` | Infraestrutura declarativa AWS SAM | CloudFormation |
 | `tests/` | Testes de rotina e integração simulada | pytest / Moto |
@@ -96,24 +98,24 @@ Para uma instalação nova do pipeline completo: **[Configuração e implantaç�
 
 **Retomada:** o SQLite guarda arquivos processados e IDs enviados por URL de fila. Após cada envio confirmado, registra o checkpoint. Se cair entre o envio e o checkpoint, pode reenviar; a Lambda evita a duplicação no banco. O bloqueio local impede duas instâncias com o mesmo `DATA_DIR` (Linux/macOS). Use apenas um produtor por fila para preservar a sequência. Os arquivos publicados são tratados como imutáveis; correções de arquivos já baixados exigem revisão do cache/estado.
 
-**Datas:** datas INPE sem fuso são interpretadas como GMT/UTC, conforme a [descrição de atributos do INPE](https://www.terrabrasilis.dpi.inpe.br/queimadas/portal/pages/secao_informacoes/faq/index.html). Todas são normalizadas para ISO 8601 UTC. O dataset é ordenado por instante, não pelo nome do CSV. No modo contínuo, cada snapshot é ordenado; arquivos atrasados podem trazer observações anteriores às já enviadas. A fila preserva a ordem de envio, não corrige atrasos da fonte.
+**Datas:** datas INPE sem fuso são interpretadas como GMT/UTC, conforme a [descrição de atributos do INPE](https://www.terrabrasilis.dpi.inpe.br/queimadas/portal/pages/secao_informacoes/faq/index.html). Todas são normalizadas para ISO 8601 UTC. O dataset é ordenado por instante, não pelo nome do CSV. Cada snapshot é ordenado; arquivos atrasados podem trazer observações anteriores às já enviadas em execuções anteriores. A fila preserva a ordem de envio, não corrige atrasos da fonte.
 
-**H3:** `latlng_to_cell(latitude, longitude, resolution)` agrupa pontos em uma grade geográfica, conforme a [API H3](https://h3geo.org/docs/api/indexing/). Resolução padrão 5. Não é DBSCAN nem identificação de incêndios: cada cluster é **intervalo de dez minutos UTC + satélite + célula H3 + resolução**. Observações em células adjacentes continuam sendo grupos distintos.
+**H3:** `latlng_to_cell(latitude, longitude, resolution)` agrupa pontos em uma grade geográfica, conforme a [API H3](https://h3geo.org/docs/api/indexing/). Resolução padrão 5. Não é DBSCAN nem identificação de incêndios: cada contador é **célula H3 + resolução**, no agregado ou por satélite. Observações em células adjacentes continuam sendo contadores distintos. A data/hora é usada apenas para ordenar o envio e compor o ID de deduplicação; não é gravada no banco.
 
-**Janelas:** a data/hora da observação determina intervalos fixos `[início, fim)` em UTC: 15:40:00 até antes de 15:50:00 pertence ao grupo `15:40`; 15:50:00 inicia o próximo grupo. O horário exato continua preservado na observação. O campo `date` do agregado contém o início completo do intervalo, e `window_end` seu fim exclusivo, incluindo a virada do dia.
-
-**DynamoDB:** uma tabela, dois tipos de item:
+**DynamoDB:** uma tabela (`pk`/`sk`, sem índice secundário), quatro tipos de item:
 
 | Item | `pk` | `sk` | Atributos |
 |---|---|---|---|
-| Agregado | `DAY#2026-11-10` | `RES#5#WINDOW10M#2026-11-10T15:40:00Z#H3#<hash>#SAT#AQUA` | `date` (início UTC), `window_end` (fim exclusivo), `satellite`, `h3`, `resolution`, `count`, `updated_at` |
-| Observação/deduplicação | `EVENT#<sha256>` | `RES#5#WINDOW10M` | data/hora exata, satélite, coordenadas, H3, ID |
+| Célula, todos os satélites | `RES#5#H3COUNT#ALL` | `H3#<hash>` | `count` |
+| Célula, um satélite | `RES#5#H3COUNT#SAT#AQUA` | `H3#<hash>` | `count` |
+| Total por satélite | `RES#5#H3COUNT#SATELLITES` | `SAT#AQUA` | `count` |
+| Deduplicação | `EVENT#<sha256>` | `RES#5#H3COUNT` | — |
 
-O ID é SHA-256 de data/hora, satélite e coordenadas com oito casas decimais. Duas linhas iguais nesses campos contam como uma observação, mesmo vindas de arquivos diferentes. A gravação do marcador e o incremento são uma transação atômica. Marcadores não expiram, para que replays antigos continuem idempotentes; o armazenamento cresce com as observações. Não apague marcadores isoladamente.
+O ID é SHA-256 de data/hora, satélite e coordenadas com oito casas decimais. Duas linhas iguais nesses campos contam como uma observação, mesmo vindas de arquivos diferentes. O marcador e os três incrementos são uma transação atômica. Marcadores não expiram, para que replays antigos continuem idempotentes; o armazenamento cresce com as observações. Não apague marcadores isoladamente.
 
-**Consulta:** a visualização atual usa `Query` no índice `ObservationsByTime`, com paginação e consistência eventual, para somar observações por H3 em todo o histórico ou nos últimos N minutos. As consultas legadas por `day`/`window` continuam lendo os agregados diretamente na tabela com leitura consistente. O backend converte bordas H3 para GeoJSON; o frontend combina as contagens entre páginas. Sempre siga `next_cursor`, mesmo se uma página estiver vazia.
+**Consulta:** `Query` com `ConsistentRead` na partição `RES#<res>#H3COUNT#ALL` ou `RES#<res>#H3COUNT#SAT#<satélite>`. O backend converte bordas H3 para GeoJSON; o frontend soma as contagens entre páginas. Sempre siga `next_cursor`, mesmo se uma página estiver vazia.
 
-**Mapa:** usa D3, projeção Mercator e limite nacional do [World Atlas](https://github.com/topojson/world-atlas). Células são recortadas visualmente pelo Brasil; os contadores incluem todas as observações recebidas para o intervalo/satélite, inclusive fora do Brasil quando o CSV não informa país. O recorte visual não é um filtro geográfico das observações. O mapa mostra todo o histórico somado por hash H3. O filtro opcional de últimos N minutos consulta timestamps exatos das observações, inclusive atravessando dias. O mapa soma satélites por célula dentro do período escolhido quando selecionado “Todos”. A consulta é refeita a cada cinco segundos após concluir a anterior, aproximando tempo real; a fonte é atualizada a cada dez minutos. A paginação durante novas escritas não representa um snapshot transacional de todo o dia, convergindo na próxima atualização. D3, TopoJSON e a malha são carregados de CDN e precisam de internet. Sem filtro temporal, todos os dados indexados são exibidos.
+**Mapa:** usa D3, projeção Mercator e limite nacional do [World Atlas](https://github.com/topojson/world-atlas). Células são recortadas visualmente pelo Brasil; os contadores incluem todas as observações recebidas, inclusive fora do Brasil quando o CSV não informa país. O recorte visual não é um filtro geográfico das observações. A consulta é refeita a cada cinco segundos após concluir a anterior; a fonte é atualizada a cada dez minutos. A paginação durante novas escritas não é um snapshot transacional e converge na próxima atualização. D3, TopoJSON e a malha são carregados de CDN e precisam de internet.
 
 ## Executar o produtor
 
@@ -132,10 +134,10 @@ export S3_BUCKET='OUTPUT-BucketName'
 export SQS_QUEUE_URL='OUTPUT-QueueUrl'
 export RECORDS_PER_MESSAGE=10
 export READ_INTERVAL_SECONDS=1
-python -m producer.main --scrape --start --watch
+python -m producer.main --scrape --start
 ```
 
-`--watch` repete a rotina a cada `POLL_SECONDS` (padrão 600 s), contado após concluir a rodada. Sem essa opção, executa uma única rodada. Para automatizar com cron, execute sem `--watch`, com diretório de trabalho e ambiente configurados; não rode cron e `--watch` simultaneamente. Linhas inválidas interrompem a ingestão do arquivo, registram nome/linha e preservam os demais checkpoints; não são descartadas silenciosamente. O formato `lat,lon,satelite,data` é aceito sem exigir país. Cabeçalhos aceitos também incluem `data_hora_gmt`, `satelite`, `lat`, `lon`, `pais` e variantes documentadas como `DataHora`, `Latitude`, `Longitude`.
+Cada execução roda a rotina uma única vez e termina. Para repetir periodicamente, agende o comando (cron, Agendador de Tarefas) com diretório de trabalho e ambiente configurados; não rode duas instâncias ao mesmo tempo. Linhas inválidas interrompem a ingestão do arquivo, registram nome/linha e preservam os demais checkpoints; não são descartadas silenciosamente. O formato `lat,lon,satelite,data` é aceito sem exigir país. Cabeçalhos aceitos também incluem `data_hora_gmt`, `satelite`, `lat`, `lon`, `pais` e variantes documentadas como `DataHora`, `Latitude`, `Longitude`.
 
 ## Executar o backend local
 
@@ -154,13 +156,13 @@ API:
 
 ```text
 GET /api/health
-GET /api/clusters?view=all
-GET /api/clusters?view=recent&minutes=60
-GET /api/clusters?day=2026-11-10&limit=500
-GET /api/clusters?day=2026-11-10&window=15:40
-GET /api/clusters?day=2026-11-10&satellite=AQUA&cursor=<next_cursor>
+GET /api/clusters                       # agregado de todos os satélites
+GET /api/clusters?satellite=AQUA        # um satélite
+GET /api/clusters?limit=500&cursor=<next_cursor>
 GET /docs  # somente no servidor FastAPI opcional
 ```
+
+`/api/clusters` aceita apenas `satellite`, `cursor` e `limit` (1–1000). Os parâmetros antigos `day`, `window`, `view`, `minutes` e `as_of` retornam **400**.
 
 ## Testes
 
@@ -170,21 +172,21 @@ python -m pytest -q tests
 node --check frontend/app.js
 ```
 
-Os testes de integração usam Moto e H3 real: verificam transações idempotentes, reentrega após falha parcial, comportamento FIFO, paginação e GeoJSON. Quando essas dependências não estão instaladas, o módulo de integração é explicitamente pulado. Os testes do produtor usam streams e clientes falsos, sem acesso à AWS/INPE.
+Os testes de integração usam Moto e H3 real: verificam que os itens guardam só hash + contagem, transações idempotentes, reentrega após falha parcial, comportamento FIFO, paginação, filtro de satélite e GeoJSON. Um teste do produtor prova que o envio S3 → SQS é streaming: a primeira mensagem sai antes de o objeto S3 ser lido por inteiro. Quando essas dependências não estão instaladas, o módulo de integração é explicitamente pulado. Os testes do produtor usam streams e clientes falsos, sem acesso à AWS/INPE.
 
 ## Limites e operação
 
 - A configuração AWS deve ser aplicada na sua conta; este repositório não inclui credenciais.
 - `infra/template.yaml` cria uma Function URL pública para leitura dos agregados, com CORS controlado por `FrontendOrigin` e output `ApiUrl`. O website é publicado separadamente. CORS não autentica chamadas; dados são públicos e invocações geram cobrança.
-- Uma partição por dia é simples para a atividade. Volumes muito maiores podem exigir shards por região/célula, além de cache e atualização incremental no frontend. O mapa atual lê todas as observações do período pelo índice a cada rodada e agrega por H3; o modo total percorre o histórico inteiro.
+- O número de itens lidos por rodada é o número de células ocupadas (não de observações), o que mantém a consulta barata mesmo com histórico longo. Cada partição de contagem recebe uma escrita por observação; volumes muito maiores podem exigir sharding das partições quentes.
 - Para reconstruir em outra resolução, altere `H3Resolution` em ambas as Lambdas e reenvie o dataset usando um novo `DATA_DIR` ou limpando somente os checkpoints `sent`, com o produtor parado. A chave de deduplicação inclui resolução; isso permite reprocessar sem misturar as contagens antigas.
 - A DLQ recebe mensagens que falharem cinco vezes. Isso permite avançar a fila após a falha, mas perde a ordem estrita em relação à mensagem que foi isolada. Corrija a causa antes de fazer redrive.
 
-## Atualizar a versão que agrupava por dia
+## Atualizar a partir das versões com tempo
 
-Reimplante consumidor e backend juntos. Os novos agregados e marcadores usam o namespace `WINDOW10M`, isolado dos itens diários antigos. O backend consulta somente os novos itens, portanto não soma dados diários com intervalos de dez minutos. Os dados antigos não são convertidos automaticamente.
+Reimplante consumidor, backend e o template juntos. O template remove o índice `ObservationsByTime` e o atributo `date`. As novas chaves usam o namespace `H3COUNT`, isoladas dos itens antigos (`DAY#...`, `WINDOW10M`); o backend lê apenas as novas partições. Os dados antigos não são convertidos automaticamente; use [o reset](docs/RESET.md) se quiser removê-los.
 
-Para popular os novos intervalos com o dataset já baixado, pare o produtor e limpe **somente os checkpoints de envio**:
+Para popular as contagens com o dataset já baixado, pare o produtor e limpe **somente os checkpoints de envio**:
 
 ```bash
 python3 - <<'PYTHON'
@@ -197,10 +199,10 @@ if not path.is_file():
 with sqlite3.connect(path) as db:
     db.execute('DELETE FROM sent WHERE destination = ?', (os.environ['SQS_QUEUE_URL'],))
 PYTHON
-python -m producer.main --scrape --start --watch
+python -m producer.main --scrape --start
 ```
 
-Faça uma cópia de segurança do SQLite antes da limpeza. Se a versão diária ainda estiver processando mensagens, aguarde a fila esvaziar ou pause o consumo durante a atualização coordenada. O novo consumidor pode ler o mesmo contrato de mensagem; a deduplicação por observação/resolução/`WINDOW10M` impede contagem repetida durante o replay. Os dados diários antigos podem permanecer na tabela, mas não aparecem na API nova.
+Faça uma cópia de segurança do SQLite antes da limpeza. Aguarde a fila esvaziar antes de trocar o consumidor. A deduplicação por observação/resolução/`H3COUNT` impede contagem repetida durante o replay.
 
 ## Website estático + Function URL
 
@@ -238,11 +240,8 @@ python -m producer.main --start
 # Complete fresh local run, including AWS streaming:
 python -m producer.main --reset --scrape --start
 
-# Continuous scrape/upload/send, resetting only once at startup if requested:
-python -m producer.main --scrape --start --watch
-
 # Download/consolidate only, without AWS access:
 python -m producer.main --prepare-only --max-files 6
 ```
 
-`--scrape` needs S3_BUCKET; `--start` needs S3_BUCKET and SQS_QUEUE_URL. Credentials are initialized only for actions that use AWS. Running without action flags displays help and does no work. Cached files and records remain cumulative unless `--reset` is used: `--max-files 6` limits newly discovered input files, not the total historical contents of an existing dataset.
+`--scrape` needs S3_BUCKET; `--start` needs S3_BUCKET and SQS_QUEUE_URL. Credentials are initialized only for actions that use AWS. Running without action flags displays help and does no work. Each invocation runs the routine once; schedule it externally to repeat. Cached files and records remain cumulative unless `--reset` is used: `--max-files 6` limits newly discovered input files, not the total historical contents of an existing dataset.

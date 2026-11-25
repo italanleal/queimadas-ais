@@ -4,9 +4,11 @@ import logging
 from datetime import datetime, timezone
 
 from botocore.exceptions import BotoCoreError, ClientError
-from backend.query import query_clusters, query_observations
+from backend.query import query_cells
 
 LOG = logging.getLogger(__name__)
+ALLOWED = {'satellite', 'cursor', 'limit'}
+REMOVED = {'day', 'window', 'view', 'minutes', 'as_of'}
 
 
 def response(status, body):
@@ -31,21 +33,17 @@ def handler(event, context):
     try:
         if not isinstance(params, dict):
             raise ValueError('Parâmetros inválidos')
+        removed = sorted(REMOVED.intersection(params))
+        if removed:
+            raise ValueError(f"Filtros de tempo não são mais suportados: {', '.join(removed)}")
+        unknown = sorted(set(params) - ALLOWED)
+        if unknown:
+            raise ValueError(f"Parâmetros desconhecidos: {', '.join(unknown)}")
         try:
             limit = int(params.get('limit', '500'))
         except (ValueError, TypeError):
             raise ValueError('limit deve ser um número inteiro') from None
-        if 'day' in params and 'view' not in params:
-            data = query_clusters(day=params.get('day'), satellite=params.get('satellite'),
-                                  window=params.get('window'), cursor=params.get('cursor'), limit=limit)
-        else:
-            try:
-                minutes = int(params['minutes']) if 'minutes' in params else None
-            except (ValueError, TypeError):
-                raise ValueError('minutes deve ser um número inteiro') from None
-            data = query_observations(view=params.get('view', 'all'), minutes=minutes,
-                                      satellite=params.get('satellite'), cursor=params.get('cursor'),
-                                      limit=limit, as_of=params.get('as_of'))
+        data = query_cells(satellite=params.get('satellite'), cursor=params.get('cursor'), limit=limit)
         return response(200, data)
     except ValueError as error:
         return response(400, {'detail': str(error)})

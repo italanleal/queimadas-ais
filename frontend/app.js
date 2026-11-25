@@ -4,7 +4,7 @@ const config = window.INPE_CONFIG || {};
 const apiBaseUrl = (config.apiBaseUrl || '').replace(/\/+$/, '');
 const refreshIntervalMs = Math.max(1000, Number(config.refreshIntervalMs) || 5000);
 const $ = id => document.getElementById(id);
-const state = {features: [], busy: false, ready: false, generation: 0, request: null};
+const state = {features: [], satellites: [], satellite: '', busy: false, ready: false, generation: 0, request: null};
 const svg = d3.select('svg');
 const scene = d3.select('#scene');
 const zoom = d3.zoom().scaleExtent([1, 12]).on('zoom', event => scene.attr('transform', event.transform));
@@ -25,21 +25,21 @@ function forD3(feature) {
 
 function draw() {
   if (!state.ready) return;
-  const satellite = $('satellite').value;
-  const cells = window.INPE_DATA.aggregateCells(state.features, satellite)
+  const cells = window.INPE_DATA.aggregateCells(state.features)
     .map(cell => ({...cell, feature: forD3(cell.feature)}));
   const max = d3.max(cells, d => d.count) || 1;
   const color = d3.scaleSequentialLog(d3.interpolateYlOrRd).domain([1, Math.max(2, max)]);
+  const label = state.satellite || 'todos os satélites';
   $('total').textContent = d3.sum(cells, d => d.count).toLocaleString('pt-BR');
   $('cells').textContent = cells.length.toLocaleString('pt-BR');
-  $('satellites').textContent = new Set(cells.flatMap(cell => cell.satellites)).size;
+  $('satellites').textContent = state.satellites.length.toLocaleString('pt-BR');
   $('range').textContent = cells.length ? `1 – ${max.toLocaleString('pt-BR')}` : 'Sem detecções';
   d3.select('#hexagons').selectAll('path').data(cells, d => d.h3).join('path')
     .attr('class', 'cell').attr('d', d => path(d.feature)).attr('fill', d => color(d.count))
-    .attr('tabindex', 0).attr('aria-label', d => `${d.count} focos, H3 ${d.h3}, ${d.satellites.join(', ')}`)
+    .attr('tabindex', 0).attr('aria-label', d => `${d.count} focos, H3 ${d.h3}, ${label}`)
     .on('pointerenter focus', (_, d) => {
       $('tooltip').hidden = false;
-      $('tooltip').textContent = `${d.count.toLocaleString('pt-BR')} focos de calor\nPrimeira observação: ${d.first}\nÚltima observação: ${d.last}\nSatélites: ${d.satellites.join(', ')}\nH3: ${d.h3}`;
+      $('tooltip').textContent = `${d.count.toLocaleString('pt-BR')} focos de calor\nSatélite: ${label}\nH3: ${d.h3}`;
     }).on('pointerleave blur', () => { $('tooltip').hidden = true; });
 }
 
@@ -50,52 +50,46 @@ async function getJSON(url, signal) {
   return response.json();
 }
 
-function timeSelection() {
-  if (!$('time-filter').checked) return {view: 'all'};
-  const minutes = Number($('minutes').value);
-  if (!Number.isInteger(minutes) || minutes < 1 || minutes > 525600) {
-    throw new Error('Informe um número inteiro de minutos entre 1 e 525600');
+// Opções do select: agregado + satélites conhecidos pela API (preserva a seleção atual).
+function updateSatelliteOptions(satellites) {
+  const names = satellites.map(s => s.satellite).sort();
+  if (state.satellite && !names.includes(state.satellite)) names.push(state.satellite);
+  const select = $('satellite');
+  const current = [...select.options].map(o => o.value).slice(1);
+  if (current.join('|') !== names.join('|')) {
+    select.replaceChildren(new Option('Todos (agregado)', ''), ...names.map(s => new Option(s, s)));
   }
-  return {view: 'recent', minutes: String(minutes)};
+  select.value = state.satellite;
 }
 
 async function refresh() {
   if (state.busy || !state.ready) return;
-  let selection;
-  try { selection = timeSelection(); } catch (error) {
-    $('status').textContent = error.message;
-    return;
-  }
   state.busy = true;
   const generation = state.generation;
+  const satellite = state.satellite;
   state.request = new AbortController();
   $('status').textContent = 'Consultando DynamoDB…';
   try {
     let cursor = null;
-    let referenceTime = null;
+    let satellites = null;
     const features = [];
     do {
-      const params = new URLSearchParams({...selection, limit: '1000'});
+      const params = new URLSearchParams({limit: '1000'});
+      if (satellite) params.set('satellite', satellite);
       if (cursor) params.set('cursor', cursor);
-      if (referenceTime) params.set('as_of', referenceTime);
       const page = await getJSON(`${apiBaseUrl}/api/clusters?${params}`, state.request.signal);
-      if (!page.reference_time || !Array.isArray(page.features)) {
-        throw new Error('Atualize a Lambda de consulta para habilitar a visão total e o filtro de tempo');
-      }
-      referenceTime = page.reference_time;
+      if (!Array.isArray(page.features)) throw new Error('Resposta inválida da API');
+      if (Array.isArray(page.satellites)) satellites = page.satellites;
       features.push(...page.features);
       cursor = page.next_cursor;
       if (generation !== state.generation) return;
     } while (cursor);
     state.features = features;
-    const selected = $('satellite').value;
-    const satellites = [...new Set(features.map(f => f.properties.satellite))].sort();
-    $('satellite').replaceChildren(new Option('Todos os satélites', ''), ...satellites.map(s => new Option(s, s)));
-    $('satellite').value = satellites.includes(selected) ? selected : '';
+    state.satellites = satellites || [];
+    updateSatelliteOptions(state.satellites);
     draw();
-    $('status').textContent = features.length ? `● Dados atualizados · atualização a cada ${refreshIntervalMs / 1000} s` : 'Sem focos no período selecionado.';
-    $('period').textContent = selection.view === 'all' ? 'Todo o histórico registrado' : `Últimos ${selection.minutes} minutos · horário da observação`;
-    $('updated').textContent = `Consulta: ${new Date(referenceTime).toLocaleTimeString('pt-BR')}`;
+    $('status').textContent = features.length ? `● Dados atualizados · atualização a cada ${refreshIntervalMs / 1000} s` : 'Sem focos registrados.';
+    $('updated').textContent = `Consulta: ${new Date().toLocaleTimeString('pt-BR')}`;
   } catch (error) {
     if (generation === state.generation) {
       $('status').textContent = `Falha ao atualizar (${error.message}). Nova tentativa automática; os dados exibidos podem estar desatualizados.`;
@@ -107,19 +101,17 @@ async function refresh() {
   }
 }
 
-function changeTimeSelection() {
+// Trocar o satélite refaz a consulta na partição correspondente (?satellite=).
+function changeSatellite() {
+  state.satellite = $('satellite').value;
   state.generation += 1;
   if (state.request) state.request.abort();
-  $('minutes').disabled = !$('time-filter').checked;
   state.features = [];
   draw();
-  $('period').textContent = $('time-filter').checked ? 'Aplicando filtro de tempo…' : 'Todo o histórico registrado';
   $('updated').textContent = 'Aguardando consulta';
   refresh();
 }
-$('time-filter').onchange = changeTimeSelection;
-$('minutes').onchange = changeTimeSelection;
-$('satellite').onchange = draw;
+$('satellite').onchange = changeSatellite;
 $('refresh').onclick = refresh;
 async function poll() {
   await refresh();

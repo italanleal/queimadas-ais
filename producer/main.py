@@ -227,9 +227,7 @@ def main(argv=None):
     parser.add_argument('--data-dir', type=Path, default=Path(os.getenv('DATA_DIR', 'data')))
     parser.add_argument('--records-per-message', type=int, default=int(os.getenv('RECORDS_PER_MESSAGE', '10')))
     parser.add_argument('--read-interval-seconds', type=float, default=float(os.getenv('READ_INTERVAL_SECONDS', '1')))
-    parser.add_argument('--poll-seconds', type=float, default=float(os.getenv('POLL_SECONDS', '600')))
     parser.add_argument('--max-files', type=int, default=0, help='0: todos os arquivos disponíveis; N: os N mais recentes')
-    parser.add_argument('--watch', action='store_true', help='Repete a rotina a cada POLL_SECONDS')
     parser.add_argument('--prepare-only', action='store_true', help='Somente download e consolidação locais')
     parser.add_argument('--all-countries', action='store_true', help='Desabilita o filtro por Brasil quando existir coluna pais/country')
     args = parser.parse_args(argv)
@@ -242,10 +240,8 @@ def main(argv=None):
         return 0
     if args.reset and args.start and not args.scrape:
         parser.error('--reset --start exige --scrape para preparar um novo dataset')
-    if args.watch and not (args.scrape or args.start):
-        parser.error('--watch exige --scrape ou --start')
-    if not 1 <= args.records_per_message <= 10 or args.read_interval_seconds < 0 or args.poll_seconds <= 0 or args.max_files < 0:
-        parser.error('Lote: 1..10; intervalo: >=0; polling: >0; max-files: >=0')
+    if not 1 <= args.records_per_message <= 10 or args.read_interval_seconds < 0 or args.max_files < 0:
+        parser.error('Lote: 1..10; intervalo: >=0; max-files: >=0')
     if (args.start or (args.scrape and not args.prepare_only)) and not args.bucket:
         parser.error('Defina S3_BUCKET ou --bucket')
     if args.start and (not args.queue_url or not args.queue_url.endswith('.fifo')):
@@ -269,16 +265,12 @@ def main(argv=None):
             s3 = sqs = None
             if args.start or (args.scrape and not args.prepare_only):
                 s3, sqs = aws_clients(args.start)
-            while True:
-                try:
-                    routine(args, db, s3, sqs)
-                except Exception:
-                    LOG.exception('Rodada interrompida; estado preservado para retomada')
-                    if not args.watch:
-                        raise
-                if not args.watch:
-                    break
-                time.sleep(args.poll_seconds)
+            # A rotina roda uma vez; agende execuções externas se precisar repetir.
+            try:
+                routine(args, db, s3, sqs)
+            except Exception:
+                LOG.exception('Rodada interrompida; estado preservado para retomada')
+                raise
         finally:
             db.close()
 

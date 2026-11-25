@@ -1,15 +1,17 @@
-"""Consumidor SQS FIFO: agrega cada observação por janela de 10 minutos UTC, satélite e H3."""
+"""Consumidor SQS FIFO: conta cada observação por célula H3, no agregado e por satélite.
+
+O banco guarda apenas hash H3 + contagem; não há dimensão de tempo nem coordenadas.
+"""
 import json
 import logging
 import os
-from datetime import datetime, timezone
 
 import boto3
 import h3
 from boto3.dynamodb.types import TypeSerializer
 from botocore.exceptions import ClientError
 
-from common.records import AGGREGATION, record, ten_minute_window
+from common.records import MODEL, cells_partition, record, satellites_partition
 
 LOG = logging.getLogger(__name__)
 LOG.setLevel(logging.INFO)
@@ -20,35 +22,34 @@ def encode(item):
     return {k: SERIALIZER.serialize(v) for k, v in item.items()}
 
 
+def increment(table, key):
+    return {'Update': {'TableName': table, 'Key': encode(key),
+                       'UpdateExpression': 'ADD #n :one',
+                       'ExpressionAttributeNames': {'#n': 'count'},
+                       'ExpressionAttributeValues': encode({':one': 1})}}
+
+
 def persist(client, table, item, resolution):
     canonical = record(item['date'], item['satellite'], item['latitude'], item['longitude'])
     if item.get('id') != canonical['id']:
         raise ValueError('Identificador do registro não corresponde ao conteúdo')
     cell = h3.latlng_to_cell(canonical['latitude'], canonical['longitude'], resolution)
-    start, end = ten_minute_window(canonical['date'])
-    day = start[:10]
-    marker = {'pk': f"EVENT#{canonical['id']}", 'sk': f'RES#{resolution}#{AGGREGATION}', **canonical, 'h3': cell}
-    # Floats não são aceitos pelo serializer DynamoDB.
-    from decimal import Decimal
-    marker['latitude'] = Decimal(str(canonical['latitude']))
-    marker['longitude'] = Decimal(str(canonical['longitude']))
-    cluster = {'pk': f'DAY#{day}', 'sk': f"RES#{resolution}#{AGGREGATION}#{start}#H3#{cell}#SAT#{canonical['satellite']}"}
-    now = datetime.now(timezone.utc).isoformat()
+    satellite = canonical['satellite']
+    marker = {'pk': f"EVENT#{canonical['id']}", 'sk': f'RES#{resolution}#{MODEL}'}
     try:
+        # Marcador e contadores na mesma transação: reentregas não contam duas vezes.
         client.transact_write_items(TransactItems=[
             {'Put': {'TableName': table, 'Item': encode(marker), 'ConditionExpression': 'attribute_not_exists(pk)'}},
-            {'Update': {'TableName': table, 'Key': encode(cluster),
-                        'UpdateExpression': 'SET #d=:d, window_end=:end, satellite=:s, h3=:h, resolution=:r, updated_at=:u ADD #n :one',
-                        'ExpressionAttributeNames': {'#d': 'date', '#n': 'count'},
-                        'ExpressionAttributeValues': encode({':d': start, ':end': end, ':s': canonical['satellite'], ':h': cell,
-                                                            ':r': resolution, ':u': now, ':one': 1})}}
+            increment(table, {'pk': cells_partition(resolution), 'sk': f'H3#{cell}'}),
+            increment(table, {'pk': cells_partition(resolution, satellite), 'sk': f'H3#{cell}'}),
+            increment(table, {'pk': satellites_partition(resolution), 'sk': f'SAT#{satellite}'}),
         ])
         return True
     except ClientError as error:
         if error.response['Error']['Code'] == 'TransactionCanceledException':
             reasons = error.response.get('CancellationReasons', [])
             if reasons and reasons[0].get('Code') == 'ConditionalCheckFailed':
-                return False  # marcador e contador são gravados na mesma transação
+                return False  # registro já contado
         raise
 
 

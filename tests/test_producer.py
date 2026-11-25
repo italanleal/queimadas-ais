@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from common.records import from_csv, record, timestamp
-from producer.main import Listing, batches, connect, consolidate, ingest, publish
+from producer.main import Listing, batches, connect, consolidate, ingest, publish, stream_dataset
 
 
 def test_timezone_and_identity():
@@ -121,18 +121,6 @@ def test_failed_send_does_not_checkpoint(tmp_path):
     db.close()
 
 
-@pytest.mark.parametrize('value,start,end', [
-    ('2026-11-13T15:40:00Z', '2026-11-13T15:40:00Z', '2026-11-13T15:50:00Z'),
-    ('2026-11-13T15:49:59.999999Z', '2026-11-13T15:40:00Z', '2026-11-13T15:50:00Z'),
-    ('2026-11-13T15:50:00Z', '2026-11-13T15:50:00Z', '2026-11-13T16:00:00Z'),
-    ('2026-11-13T23:59:59Z', '2026-11-13T23:50:00Z', '2026-11-14T00:00:00Z'),
-    ('2026-11-13T23:59:59-03:00', '2026-11-14T02:50:00Z', '2026-11-14T03:00:00Z'),
-])
-def test_ten_minute_windows(value, start, end):
-    from common.records import ten_minute_window
-    assert ten_minute_window(value) == (start, end)
-
-
 def test_inpe_four_column_csv_without_country(tmp_path, caplog):
     db = connect(tmp_path / 'state.db')
     source = tmp_path / 'focos_10min_20261113_2000.csv'
@@ -146,4 +134,52 @@ def test_inpe_four_column_csv_without_country(tmp_path, caplog):
     assert rows[0]['satellite'] == 'GOES-19'
     assert all(float(r['longitude']) < -80 for r in rows)
     assert ingest(db, source) == 0
+    db.close()
+
+
+class TrackedBody(io.BytesIO):
+    """Corpo S3 que registra quantos bytes já foram lidos do objeto."""
+    def __init__(self, content):
+        super().__init__(content)
+        self.size = len(content)
+        self.max_read = 0
+    def _track(self, result):
+        self.max_read = max(self.max_read, self.tell())
+        return result
+    def read(self, *args):
+        return self._track(super().read(*args))
+    def read1(self, *args):
+        return self._track(super().read1(*args))
+    def readinto(self, *args):
+        return self._track(super().readinto(*args))
+
+
+def test_stream_sends_first_message_before_reading_whole_s3_object(tmp_path):
+    db = connect(tmp_path / 'state.db')
+    with db:
+        for i in range(5000):
+            item = record(f'2026-11-10T00:{i // 60 % 60:02}:{i % 60:02}Z', f'SAT{i}', -10, -50)
+            db.execute('INSERT INTO records VALUES (?,?,?)', (item['id'], item['date'], json.dumps(item)))
+    path, _ = consolidate(db, tmp_path)
+    body = TrackedBody(path.read_bytes())
+    assert body.size > 100 * 1024  # bem maior que o buffer de leitura do TextIOWrapper
+
+    class StreamingS3:
+        def get_object(self, **kwargs):
+            return {'Body': body}
+
+    class RecordingSQS(SQS):
+        def __init__(self):
+            super().__init__()
+            self.read_at_send = []
+        def send_message(self, **kwargs):
+            self.read_at_send.append(body.max_read)
+            super().send_message(**kwargs)
+
+    sqs = RecordingSQS()
+    assert stream_dataset(db, StreamingS3(), sqs, 'bucket', 'queue.fifo', 'consolidated/x.csv', 10, 0) == 5000
+    # 1ª mensagem saiu quando só uma fração pequena do objeto tinha sido lida.
+    assert sqs.read_at_send[0] < body.size // 10
+    assert sqs.read_at_send == sorted(sqs.read_at_send)
+    assert body.max_read == body.size
     db.close()

@@ -54,22 +54,11 @@ Resources:
           AttributeType: S
         - AttributeName: sk
           AttributeType: S
-        - AttributeName: date
-          AttributeType: S
       KeySchema:
         - AttributeName: pk
           KeyType: HASH
         - AttributeName: sk
           KeyType: RANGE
-      GlobalSecondaryIndexes:
-        - IndexName: ObservationsByTime
-          KeySchema:
-            - AttributeName: sk
-              KeyType: HASH
-            - AttributeName: date
-              KeyType: RANGE
-          Projection:
-            ProjectionType: ALL
       SSESpecification:
         SSEEnabled: true
       PointInTimeRecoverySpecification:
@@ -132,9 +121,7 @@ Resources:
         - Statement:
             - Effect: Allow
               Action: dynamodb:Query
-              Resource:
-                - !GetAtt DataTable.Arn
-                - !Sub '${DataTable.Arn}/index/ObservationsByTime'
+              Resource: !GetAtt DataTable.Arn
   BackendUrl:
     Type: AWS::Lambda::Url
     Properties:
