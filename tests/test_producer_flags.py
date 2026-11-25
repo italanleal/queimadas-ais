@@ -98,3 +98,11 @@ def test_reset_start_without_scrape_rejected_before_deleting(pipeline):
     with pytest.raises(SystemExit):
         producer.main(base + ['--reset', '--start'])
     assert saved.read_text() == 'keep'
+
+
+@pytest.mark.parametrize('flag', [['--watch'], ['--poll-seconds', '600']])
+def test_watch_loop_was_removed(pipeline, flag):
+    base, _, _, _, clients = pipeline
+    with pytest.raises(SystemExit):
+        producer.main(base + ['--scrape'] + flag)
+    assert clients == []

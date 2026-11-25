@@ -1,14 +1,14 @@
 """Servidor opcional para desenvolvimento local; usa a mesma consulta da Lambda."""
 import logging
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 from botocore.exceptions import BotoCoreError, ClientError
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.staticfiles import StaticFiles
-from backend.query import query_clusters, query_observations
+from backend.query import query_cells
 
-app = FastAPI(title='Focos INPE • H3', version='2.0.0')
+app = FastAPI(title='Focos INPE • H3', version='3.0.0')
 LOG = logging.getLogger(__name__)
 
 
@@ -17,16 +17,18 @@ def health():
     return {'status': 'ok', 'time': datetime.now(timezone.utc).isoformat()}
 
 
+REMOVED = ('day', 'window', 'view', 'minutes', 'as_of')
+
+
 @app.get('/api/clusters')
-def clusters(day: date | None = None, satellite: str | None = Query(None, max_length=100),
-             window: str | None = Query(None, pattern=r'^(?:[01][0-9]|2[0-3]):[0-5]0$'),
+def clusters(request: Request, satellite: str | None = Query(None, max_length=100),
              cursor: str | None = Query(None, max_length=4096),
-             limit: int = Query(500, ge=1, le=1000),
-             view: str | None = None, minutes: int | None = None, as_of: str | None = None):
+             limit: int = Query(500, ge=1, le=1000)):
+    removed = [name for name in REMOVED if name in request.query_params]
+    if removed:
+        raise HTTPException(400, f"Filtros de tempo não são mais suportados: {', '.join(removed)}")
     try:
-        if day is not None and view is None:
-            return query_clusters(day.isoformat(), satellite, window, cursor, limit)
-        return query_observations(view or 'all', minutes, satellite, cursor, limit, as_of)
+        return query_cells(satellite, cursor, limit)
     except ValueError as error:
         raise HTTPException(400, str(error)) from error
     except (ClientError, BotoCoreError):

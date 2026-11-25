@@ -1,6 +1,6 @@
 # Mapa estático com Lambda Function URL pública
 
-> **Visualização atual:** total acumulado por H3, com filtro opcional de últimos N minutos. Consulte [configuração do índice e atualização da Lambda](VISUALIZACAO_TEMPO.md). As consultas por dia/dez minutos descritas abaixo permanecem como API de compatibilidade.
+> **Modelo atual:** o banco guarda apenas hash H3 + contagem, sem tempo. O mapa mostra o total acumulado por célula; o único filtro é o de satélite (agregado ou um satélite).
 
 Arquitetura: **website estático → HTTPS Function URL → Lambda de consulta → DynamoDB**. O produtor continua na sua máquina. Não é necessário usuário IAM local para abrir o mapa. A Lambda utiliza uma execution role com leitura somente da tabela. O frontend não contém chaves AWS. Não há API Gateway nem servidor permanente.
 
@@ -18,15 +18,12 @@ Abra a role → Adicionar permissões → Criar política em linha → JSON:
   "Statement": [{
     "Effect": "Allow",
     "Action": "dynamodb:Query",
-    "Resource": [
-      "arn:aws:dynamodb:sa-east-1:053109836747:table/inpe-focos-clusters",
-      "arn:aws:dynamodb:sa-east-1:053109836747:table/inpe-focos-clusters/index/ObservationsByTime"
-    ]
+    "Resource": "arn:aws:dynamodb:sa-east-1:053109836747:table/inpe-focos-clusters"
   }]
 }
 ```
 
-Nome da política: `inpe-focos-api-read`. Essa role não precisa de S3, SQS, Scan nem gravação no banco. Não utilize a role do consumidor para esta função.
+Nome da política: `inpe-focos-api-read`. Essa role não precisa de S3, SQS, Scan, índices nem gravação no banco. Se a tabela ainda tiver o índice `ObservationsByTime` de versões anteriores, ele pode ser removido no console (DynamoDB → Índices). Não utilize a role do consumidor para esta função.
 
 ## 2. Preparar o ZIP no CloudShell
 
@@ -104,7 +101,7 @@ aws lambda add-permission --function-name inpe-focos-api \
 
 A API é pública: CORS controla o acesso por navegadores, mas não autentica chamadas. O código responde somente a GET e expõe apenas os agregados, sem endpoints de escrita ou leitura dos itens de observações individuais. Invocações e consultas podem gerar cobrança.
 
-Abra a URL seguida de `/api/health` e depois `/api/clusters?day=2026-11-13`. Outros parâmetros disponíveis: `window=15:40`, `satellite=GOES-19`, `limit=500` e `cursor`. A paginação limita cada resposta a 1000 itens. O frontend segue `next_cursor` até concluir a consulta.
+Abra a URL seguida de `/api/health` e depois `/api/clusters`. Parâmetros disponíveis: `satellite=GOES-19`, `limit=500` e `cursor`; `day`, `window`, `view`, `minutes` e `as_of` retornam 400. A paginação limita cada resposta a 1000 itens. O frontend segue `next_cursor` até concluir a consulta.
 
 ## 5. Configurar o frontend estático
 

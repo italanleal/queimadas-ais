@@ -13,12 +13,7 @@ import pytest
 def query_module(monkeypatch):
     class Key:
         def __init__(self, name): self.name = name
-        def eq(self, value): return self
-        def begins_with(self, value): return self
-        def between(self, start, end): self.bounds = (start, end); return self
-        def __and__(self, other):
-            if hasattr(other, 'bounds'): self.bounds = other.bounds
-            return self
+        def eq(self, value): self.value = value; return self
     sdk = ModuleType('boto3')
     table = Mock()
     sdk.resource = Mock()
@@ -38,71 +33,57 @@ def query_module(monkeypatch):
     return module, table
 
 
+def pages(cells, satellites=(), last=None):
+    """Primeira chamada: células; segunda: catálogo de satélites."""
+    return [{'Items': cells, **({'LastEvaluatedKey': last} if last else {})}, {'Items': list(satellites)}]
+
+
 @pytest.mark.parametrize('params', [
-    {'day': None}, {'day': '2026-02-30'}, {'day': '20261113'},
-    {'day': '2026-11-13', 'window': '15:41'}, {'day': '2026-11-13', 'window': '24:00'},
-    {'day': '2026-11-13', 'limit': 1001}, {'day': '2026-11-13', 'limit': 0},
-    {'day': '2026-11-13', 'cursor': 'bad'},
+    {'limit': 1001}, {'limit': 0}, {'limit': True}, {'limit': '10'},
+    {'satellite': ''}, {'satellite': 'X' * 101}, {'satellite': 5},
+    {'cursor': 'bad'}, {'cursor': 'x' * 5000},
 ])
 def test_validation_before_database_call(query_module, params):
     module, table = query_module
-    with pytest.raises(ValueError): module.query_clusters(**params)
+    with pytest.raises(ValueError): module.query_cells(**params)
     table.query.assert_not_called()
 
 
-def test_geojson_cursor_and_satellite_filter(query_module):
+def test_aggregate_geojson_satellites_and_cursor(query_module):
     module, table = query_module
-    key = {'pk': 'DAY#2026-11-13', 'sk': 'RES#5#WINDOW10M#2026-11-13T15:40:00Z#H3#abc#SAT#AQUA'}
-    item = {'date': '2026-11-13T15:40:00Z', 'window_end': '2026-11-13T15:50:00Z',
-            'satellite': 'AQUA', 'h3': 'abc', 'count': 2, 'resolution': 5, 'updated_at': 'now'}
-    table.query.return_value = {'Items': [item], 'LastEvaluatedKey': key}
-    result = module.query_clusters('2026-11-13', window='15:40')
-    ring = result['features'][0]['geometry']['coordinates'][0]
+    last = {'pk': 'RES#5#H3COUNT#ALL', 'sk': 'H3#abc'}
+    table.query.side_effect = pages([{'pk': 'RES#5#H3COUNT#ALL', 'sk': 'H3#abc', 'count': 3}],
+                                    [{'sk': 'SAT#AQUA', 'count': 2}, {'sk': 'SAT#TERRA', 'count': 1}], last)
+    result = module.query_cells()
+    cells_request = table.query.call_args_list[0].kwargs
+    assert cells_request['KeyConditionExpression'].value == 'RES#5#H3COUNT#ALL'
+    assert cells_request['ConsistentRead'] is True
+    assert table.query.call_args_list[1].kwargs['KeyConditionExpression'].value == 'RES#5#H3COUNT#SATELLITES'
+    feature = result['features'][0]
+    assert feature['properties'] == {'h3': 'abc', 'count': 3, 'resolution': 5}
+    ring = feature['geometry']['coordinates'][0]
     assert ring[0] == [-50, -10] and ring[-1] == ring[0]
-    assert result['features'][0]['properties']['count'] == 2
-    assert json.loads(base64.urlsafe_b64decode(result['next_cursor'])) == key
-    module.query_clusters('2026-11-13', window='15:40', cursor=result['next_cursor'])
-    assert table.query.call_args.kwargs['ExclusiveStartKey'] == key
-    assert table.query.call_args.kwargs['ConsistentRead'] is True
-    assert module.query_clusters('2026-11-13', satellite='TERRA')['features'] == []
-    with pytest.raises(ValueError): module.query_clusters('2026-11-14', cursor=result['next_cursor'])
-    with pytest.raises(ValueError): module.query_clusters('2026-11-13', window='15:50', cursor=result['next_cursor'])
+    assert result['satellites'] == [{'satellite': 'AQUA', 'count': 2}, {'satellite': 'TERRA', 'count': 1}]
+    assert json.loads(base64.urlsafe_b64decode(result['next_cursor'])) == last
+    # Páginas seguintes não repetem o catálogo de satélites.
+    table.query.reset_mock(side_effect=True)
+    table.query.return_value = {'Items': []}
+    second = module.query_cells(cursor=result['next_cursor'])
+    assert table.query.call_count == 1
+    assert table.query.call_args.kwargs['ExclusiveStartKey'] == last
+    assert 'satellites' not in second and second['next_cursor'] is None
 
 
-def test_observations_all_groups_same_hash_across_hours(query_module):
+def test_satellite_partition_and_cursor_bound_to_partition(query_module):
     module, table = query_module
-    table.query.return_value = {'Items': [
-        {'h3': 'abc', 'satellite': 'AQUA', 'date': '2026-11-13T01:00:00.000000Z'},
-        {'h3': 'abc', 'satellite': 'AQUA', 'date': '2026-11-13T02:00:00.000000Z'},
-        {'h3': 'abc', 'satellite': 'TERRA', 'date': '2026-11-12T02:00:00.000000Z'}]}
-    result = module.query_observations()
-    assert sum(f['properties']['count'] for f in result['features']) == 3
-    assert len({f['properties']['h3'] for f in result['features']}) == 1
-    assert result['features'][0]['properties']['count'] == 2
-    request = table.query.call_args.kwargs
-    assert request['IndexName'] == 'ObservationsByTime'
-    assert 'ConsistentRead' not in request
-
-
-def test_recent_cutoff_crosses_midnight_and_cursor_keeps_reference(query_module):
-    module, table = query_module
-    key = {'pk': 'EVENT#abc', 'sk': 'RES#5#WINDOW10M', 'date': '2026-11-12T23:50:00.000000Z'}
-    table.query.return_value = {'Items': [], 'LastEvaluatedKey': key}
-    result = module.query_observations('recent', minutes=60, as_of='2026-11-13T00:30:00Z')
-    assert result['cutoff'] == '2026-11-12T23:30:00.000000Z'
-    assert table.query.call_args.kwargs['KeyConditionExpression'].bounds == ('2026-11-12T23:30:00.000000Z', '2026-11-13T00:30:00.000000Z')
-    assert result['reference_time'] == '2026-11-13T00:30:00.000000Z'
-    module.query_observations('recent', minutes=60, as_of=result['reference_time'], cursor=result['next_cursor'])
-    assert table.query.call_args.kwargs['ExclusiveStartKey'] == key
-    with pytest.raises(ValueError):
-        module.query_observations('recent', minutes=30, as_of=result['reference_time'], cursor=result['next_cursor'])
-
-
-@pytest.mark.parametrize('kwargs', [
-    {'view': 'bad'}, {'view': 'recent'}, {'view': 'recent', 'minutes': 0},
-    {'view': 'recent', 'minutes': 1.5}, {'view': 'all', 'minutes': 60},
-    {'as_of': 'bad'}, {'as_of': '2026-11-13T01:00:00'}, {'limit': 0}, {'cursor': 'bad'}])
-def test_observation_validation(query_module, kwargs):
-    module, table = query_module
-    with pytest.raises(ValueError): module.query_observations(**kwargs)
+    last = {'pk': 'RES#5#H3COUNT#SAT#AQUA', 'sk': 'H3#abc'}
+    table.query.side_effect = pages([{'sk': 'H3#abc', 'count': 2}], [{'sk': 'SAT#AQUA', 'count': 2}], last)
+    result = module.query_cells(satellite=' aqua ')
+    assert table.query.call_args_list[0].kwargs['KeyConditionExpression'].value == 'RES#5#H3COUNT#SAT#AQUA'
+    assert result['satellite'] == 'AQUA'
+    table.query.reset_mock(side_effect=True)
+    with pytest.raises(ValueError): module.query_cells(cursor=result['next_cursor'])
+    with pytest.raises(ValueError): module.query_cells(satellite='TERRA', cursor=result['next_cursor'])
+    forged = base64.urlsafe_b64encode(json.dumps({'pk': 'RES#5#H3COUNT#SAT#AQUA', 'sk': 'SAT#AQUA'}).encode()).decode()
+    with pytest.raises(ValueError): module.query_cells(satellite='AQUA', cursor=forged)
     table.query.assert_not_called()

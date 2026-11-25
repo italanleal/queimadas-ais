@@ -77,20 +77,19 @@ export S3_BUCKET='OUTPUT-BucketName'
 export SQS_QUEUE_URL='OUTPUT-QueueUrl'
 export RECORDS_PER_MESSAGE=10
 export READ_INTERVAL_SECONDS=0.5
-export POLL_SECONDS=600
 python3.12 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r producer/requirements.txt
 python -m producer.main --scrape --start --max-files 6
 ```
 
-O perfil deve existir antes de executar os comandos. `inpe-producer` é um nome ilustrativo. Para manter o processamento de todos os novos arquivos:
+O perfil deve existir antes de executar os comandos. `inpe-producer` é um nome ilustrativo. Para processar todos os arquivos da listagem ainda não processados:
 
 ```bash
-python -m producer.main --scrape --start --watch
+python -m producer.main --scrape --start
 ```
 
-Isso inclui todos os arquivos da listagem ainda não processados. O teste com `--max-files 6` pode retornar zero focos do Brasil se os arquivos recentes estiverem vazios ou contiverem apenas outros países em formatos que informam país. Para uma demonstração com mais dados, amplie a quantidade ou remova o limite.
+Cada execução roda a rotina uma vez; para repetir periodicamente, agende o comando (cron, Agendador de Tarefas). O teste com `--max-files 6` pode retornar zero focos do Brasil se os arquivos recentes estiverem vazios ou contiverem apenas outros países em formatos que informam país. Para uma demonstração com mais dados, amplie a quantidade ou remova o limite.
 
 O arquivo `.env.example` descreve as variáveis, mas não é carregado automaticamente. Exporte-as no shell; `AWS_PROFILE` do produtor deve ter acesso à mesma conta e região da fila e do bucket. Guarde `data/state.sqlite3` para preservar a retomada. Não remova esse diretório no fluxo normal.
 
@@ -114,7 +113,7 @@ export AWS_PROFILE=inpe-deploy
 sam logs --name Consumer --stack-name inpe-h3 --tail
 ```
 
-O consumidor registra falhas no CloudWatch. Em DynamoDB → Explore items, procure uma partição como `DAY#2026-11-10`: os itens contêm `date` (início da janela de dez minutos em UTC), `window_end` (fim exclusivo), `satellite`, `h3` e `count`. As partições `EVENT#...` preservam o timestamp exato e a chave de deduplicação.
+O consumidor registra falhas no CloudWatch. Em DynamoDB → Explore items, procure a partição `RES#5#H3COUNT#ALL` (agregado), `RES#5#H3COUNT#SAT#<satélite>` (um satélite) ou `RES#5#H3COUNT#SATELLITES` (total por satélite). Os itens contêm apenas `pk`, `sk` (`H3#<hash>` ou `SAT#<nome>`) e `count`; não há data nem coordenadas. As partições `EVENT#...` guardam só a chave de deduplicação.
 
 O [uso de transações](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/transaction-apis.html) impede que uma interrupção grave o contador sem gravar o marcador. A política usa `dynamodb:PutItem` e `dynamodb:UpdateItem`, que autorizam as respectivas operações dentro de `TransactWriteItems`.
 
@@ -138,7 +137,7 @@ O navegador não utiliza credenciais AWS; a Lambda usa uma execution role com so
 | Download falha | DNS/HTTPS do INPE; o script tenta quatro vezes e preserva estado |
 | Cabeçalho não reconhecido | CSV real em `data/raw/`, erro de linha nos logs; não descarte o erro sem verificar o formato |
 | Fila acumula mensagens | Trigger habilitado, logs Lambda, quota, erros de transação e DLQ |
-| Mapa sem dados | Dia UTC escolhido, resolução igual à do consumidor e existência de itens `DAY#...` |
+| Mapa sem dados | Resolução igual à do consumidor e existência de itens `RES#<res>#H3COUNT#ALL` |
 | HTTP 503 | Região/tabela/role do backend; logs da função Backend |
 | Mapa base não carrega | Acesso do navegador ao CDN jsDelivr |
 | Deploy de concorrência falha | Quota da conta e capacidade de reservar 1 execução |
@@ -153,6 +152,6 @@ Há cobrança potencial de S3, SQS, DynamoDB (incluindo transações e recupera�
 
 Para encerrar, pare o produtor e remova a stack com `sam delete --stack-name inpe-h3`. O bucket deve estar vazio, inclusive versões e delete markers, para sua remoção. A tabela tem `DeletionPolicy: Retain` e permanece após a stack ser apagada; remova-a manualmente apenas quando não precisar mais dos dados. Verifique também imagens/repositórios ECR e logs restantes.
 
-## Migração do agrupamento diário
+## Migração das versões com tempo
 
-Reimplante as duas funções e reenvie o dataset seguindo a [rotina de migração no README](../README.md#atualizar-a-versão-que-agrupava-por-dia). As chaves novas incluem `WINDOW10M`; a API ignora os agregados antigos. Reiniciar apenas o produtor sem limpar os checkpoints não reenvia observações já enviadas.
+Reimplante a stack (remove o índice `ObservationsByTime`) e reenvie o dataset seguindo a [rotina de migração no README](../README.md#atualizar-a-partir-das-versões-com-tempo). As chaves novas usam `H3COUNT`; a API ignora os itens antigos (`DAY#...`, `WINDOW10M`). Reiniciar apenas o produtor sem limpar os checkpoints não reenvia observações já enviadas.

@@ -2,7 +2,7 @@
 import hashlib
 import math
 import unicodedata
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 
 def key(value):
@@ -48,12 +48,15 @@ def from_csv(row, brazil_only=True):
                   pick('lon', 'long', 'longitude'))
 
 
-AGGREGATION = 'WINDOW10M'
+MODEL = 'H3COUNT'
 
 
-def ten_minute_window(value):
-    """Janela UTC [início, fim), determinada pelo horário da observação."""
-    dt = datetime.fromisoformat(timestamp(value).replace('Z', '+00:00'))
-    start = dt.replace(minute=(dt.minute // 10) * 10, second=0, microsecond=0)
-    end = start + timedelta(minutes=10)
-    return tuple(t.isoformat(timespec='seconds').replace('+00:00', 'Z') for t in (start, end))
+def cells_partition(res, satellite=None):
+    """Partição das contagens por célula: agregado de todos os satélites ou um satélite."""
+    base = f'RES#{res}#{MODEL}'
+    return f'{base}#ALL' if satellite is None else f'{base}#SAT#{satellite}'
+
+
+def satellites_partition(res):
+    """Partição com a contagem total por satélite; serve de catálogo para o filtro."""
+    return f'RES#{res}#{MODEL}#SATELLITES'

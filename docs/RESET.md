@@ -23,7 +23,7 @@ python3 ~/reset_aws_data.py
 python3 ~/reset_aws_data.py --execute
 ```
 
-If boto3 is unavailable, install `python3 -m pip install --user boto3`. The script checks the account and table key schema before deletion and validates S3 ownership. It reports an error and exits nonzero on partial deletion failures; earlier deletions are not rolled back. After fixing a permissions/retention error, rerun. The GSI can take a little time to reflect table deletions.
+If boto3 is unavailable, install `python3 -m pip install --user boto3`. The script checks the account and table key schema before deletion and validates S3 ownership. It reports an error and exits nonzero on partial deletion failures; earlier deletions are not rolled back. After fixing a permissions/retention error, rerun.
 
 ## Local machine
 
