@@ -2,6 +2,6 @@
  * Vazio usa a mesma origem, para desenvolvimento com o backend local.
  */
 window.INPE_CONFIG = {
-  apiBaseUrl: 'https://tnr25fge5gpbgzvlnn7xte77wy0uhnvm.lambda-url.sa-east-1.on.aws/',
+  apiBaseUrl: 'https://a7lx2evv342aieq32esf6oypge0thnkw.lambda-url.us-east-2.on.aws/',
   refreshIntervalMs: 5000
 };
