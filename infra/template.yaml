@@ -11,6 +11,16 @@ Parameters:
     Default: 5
     MinValue: 0
     MaxValue: 15
+  ReserveConsumerConcurrency:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      'true' reserva concorrencia = 1 no consumidor. Use 'false' apenas em contas com
+      quota de concorrencia Lambda baixa (ex. 10); a fila FIFO com um unico
+      MessageGroupId continua entregando uma mensagem por vez.
+Conditions:
+  ReserveConcurrency: !Equals [!Ref ReserveConsumerConcurrency, 'true']
 Resources:
   DatasetBucket:
     Type: AWS::S3::Bucket
@@ -81,7 +91,7 @@ Resources:
       Architectures: [x86_64]
       Timeout: 60
       MemorySize: 256
-      ReservedConcurrentExecutions: 1
+      ReservedConcurrentExecutions: !If [ReserveConcurrency, 1, !Ref AWS::NoValue]
       Environment:
         Variables:
           TABLE_NAME: !Ref DataTable

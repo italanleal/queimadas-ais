@@ -23,7 +23,9 @@ def test_queue_consumer_and_iam_configuration():
     template = yaml.load(Path('infra/template.yaml').read_text(), Loader=CloudFormationLoader)
     resources = template['Resources']
     consumer = resources['Consumer']['Properties']
-    assert consumer['ReservedConcurrentExecutions'] == 1
+    template_params = template['Parameters']
+    assert template_params['ReserveConsumerConcurrency']['Default'] == 'true'
+    assert consumer['ReservedConcurrentExecutions'] == {'If': ['ReserveConcurrency', 1, {'Ref': 'AWS::NoValue'}]}
     event = consumer['Events']['Queue']['Properties']
     assert event['BatchSize'] == 1
     assert event['FunctionResponseTypes'] == ['ReportBatchItemFailures']
